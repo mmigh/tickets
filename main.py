@@ -1,19 +1,21 @@
-# tickets.py — Ticket Bot with persistent buttons + uptime via Flask
-import discord
+# =====================================================
+# Discord Ticket Bot — Full Version + UptimeRobot Support
+# =====================================================
+
+import discord, asyncio, os, json, threading
 from discord.ext import commands
 from discord import app_commands
-import json, os, asyncio, threading
 from dotenv import load_dotenv
 from io import StringIO
-from typing import List
 from flask import Flask
 
-# ====== FILE PATHS ======
+# ================= FILES =================
 CONFIG_FILE = "config.json"
 TICKET_FILE = "tickets.json"
 BLACKLIST_FILE = "blacklist.json"
 
-# ====== STORAGE ======
+
+# ================= STORAGE =================
 class Storage:
     def __init__(self, path, default):
         self.path = path
@@ -39,13 +41,12 @@ class Storage:
         self._dirty = False
 
 
-# ====== GLOBAL STORAGE INSTANCES ======
 config = Storage(CONFIG_FILE, {})
 tickets = Storage(TICKET_FILE, {"last_id": 0, "tickets": {}})
 blacklist = Storage(BLACKLIST_FILE, {"users": [], "roles": []})
 
 
-# ====== PERIODIC SAVE TASK ======
+# ================= AUTO SAVE =================
 async def periodic_saver():
     while True:
         await asyncio.sleep(5)
@@ -57,7 +58,7 @@ async def periodic_saver():
                     print("Save failed:", e)
 
 
-# ====== HELPERS ======
+# ================= HELPERS =================
 def ensure_guild_config(gid: str):
     if gid not in config.data:
         config.data[gid] = {
@@ -78,7 +79,7 @@ def is_blacklisted(guild: discord.Guild, user: discord.Member):
     return None
 
 
-async def ensure_logs_channel(guild: discord.Guild) -> discord.TextChannel:
+async def ensure_logs_channel(guild: discord.Guild):
     gid = str(guild.id)
     gconf = config.data.get(gid, {})
     if gconf.get("log_channel"):
@@ -96,152 +97,233 @@ async def ensure_logs_channel(guild: discord.Guild) -> discord.TextChannel:
     return ch
 
 
-async def log_ticket_event(guild: discord.Guild, message: str):
+async def log_ticket_event(guild, message):
     try:
         ch = await ensure_logs_channel(guild)
         await ch.send(message)
     except Exception as e:
-        print("Failed to log event:", e)
+        print("Failed to log:", e)
 
 
-async def generate_transcript(channel: discord.TextChannel) -> discord.File:
+async def generate_transcript(channel):
     buf = StringIO()
-    buf.write(f"<html><head><meta charset='utf-8'><title>{channel.name}</title></head><body>")
-    buf.write(f"<h2>Transcript of {channel.name}</h2><hr>\n")
+    buf.write(f"<html><meta charset='utf-8'><body>")
+    buf.write(f"<h2>Transcript: {channel.name}</h2><hr>")
     async for m in channel.history(limit=None, oldest_first=True):
         ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        author = f"{m.author} ({m.author.id})"
-        content = m.clean_content.replace('\n', '<br>')
-        buf.write(f"<p><b>[{ts}] {author}:</b> {content}</p>\n")
-        for a in m.attachments:
-            buf.write(f"<p>📎 <a href='{a.url}'>{a.filename}</a></p>\n")
+        buf.write(f"<p><b>[{ts}] {m.author}:</b> {m.clean_content}</p>")
     buf.write("</body></html>")
     buf.seek(0)
-    return discord.File(fp=buf, filename=f"{channel.name}-transcript.html")
+    return discord.File(buf, f"{channel.name}-transcript.html")
 
 
-# ====== PERMISSIONS ======
+# ================= PERMISSIONS =================
 def is_admin_or_staff():
-    async def pred(interaction: discord.Interaction):
-        gid = str(interaction.guild.id)
+    async def pred(inter: discord.Interaction):
+        gid = str(inter.guild.id)
         gconf = config.data.get(gid, {})
-        if interaction.user.guild_permissions.administrator:
+        if inter.user.guild_permissions.administrator:
             return True
-        staff_role_id = gconf.get("staff_role")
-        if staff_role_id:
-            role = interaction.guild.get_role(staff_role_id)
-            if role and role in interaction.user.roles:
+        staff_role = gconf.get("staff_role")
+        if staff_role:
+            r = inter.guild.get_role(staff_role)
+            if r and r in inter.user.roles:
                 return True
         raise app_commands.CheckFailure("❌ Bạn không có quyền dùng lệnh này.")
     return app_commands.check(pred)
 
 
 def is_admin_or_staff_or_owner():
-    async def pred(interaction: discord.Interaction):
-        gid = str(interaction.guild.id)
+    async def pred(inter: discord.Interaction):
+        gid = str(inter.guild.id)
         gconf = config.data.get(gid, {})
-        if interaction.user.guild_permissions.administrator:
+        if inter.user.guild_permissions.administrator:
             return True
-        staff_role_id = gconf.get("staff_role")
-        if staff_role_id:
-            role = interaction.guild.get_role(staff_role_id)
-            if role and role in interaction.user.roles:
+        staff_role = gconf.get("staff_role")
+        if staff_role:
+            r = inter.guild.get_role(staff_role)
+            if r and r in inter.user.roles:
                 return True
-        cid = str(interaction.channel.id)
-        if cid in tickets.data.get("tickets", {}):
-            if tickets.data["tickets"][cid]["user"] == interaction.user.id:
+        cid = str(inter.channel.id)
+        if cid in tickets.data["tickets"]:
+            if tickets.data["tickets"][cid]["user"] == inter.user.id:
                 return True
         raise app_commands.CheckFailure("❌ Bạn không có quyền dùng lệnh này.")
     return app_commands.check(pred)
 
 
-# ====== BOT SETUP ======
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
-intents.message_content = True
+# ================= BOT =================
+intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-# ====== MAKE TICKET VIEW ======
-def make_ticket_view(guild_id: int) -> discord.ui.View:
+# ================= MAKE BUTTONS =================
+def make_ticket_view(guild_id: int):
     gid = str(guild_id)
     gconf = config.data.get(gid, {})
-    custom = gconf.get("custom_buttons", []) if gconf else []
     view = discord.ui.View(timeout=None)
-
-    # Standard buttons
-    standard = [("🛒 Mua hàng", "Mua hàng"), ("⚡ Cày thuê", "Cày thuê"),
-                ("🛠️ Báo lỗi", "Báo lỗi"), ("📩 Khác", "Khác")]
+    custom = gconf.get("custom_buttons", [])
+    standard = [("🛒 Mua hàng", "Mua hàng"),
+                ("⚡ Cày thuê", "Cày thuê"),
+                ("🛠️ Báo lỗi", "Báo lỗi"),
+                ("📩 Khác", "Khác")]
 
     def make_cb(ttype):
-        async def cb(interaction: discord.Interaction):
-            await interaction.response.defer(ephemeral=True)
-            await create_ticket_from_interaction(interaction, ttype)
+        async def cb(inter):
+            await inter.response.defer(ephemeral=True)
+            await create_ticket_from_interaction(inter, ttype)
         return cb
 
-    for idx, (label, ttype) in enumerate(standard):
-        cid = f"ticket_std_{gid}_{idx}"
-        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, custom_id=cid)
+    for i, (label, ttype) in enumerate(standard):
+        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, custom_id=f"std_{gid}_{i}")
         btn.callback = make_cb(ttype)
         view.add_item(btn)
 
-    for cidx, label in enumerate(custom):
-        cid = f"ticket_custom_{gid}_{cidx}"
-        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary, custom_id=cid)
-        async def cb(interaction: discord.Interaction, lbl=label):
-            await interaction.response.defer(ephemeral=True)
-            await create_ticket_from_interaction(interaction, lbl)
+    for i, lbl in enumerate(custom):
+        btn = discord.ui.Button(label=lbl, style=discord.ButtonStyle.primary, custom_id=f"cus_{gid}_{i}")
+        async def cb(inter, t=lbl):
+            await inter.response.defer(ephemeral=True)
+            await create_ticket_from_interaction(inter, t)
         btn.callback = cb
         view.add_item(btn)
 
     return view
 
 
-# ====== CREATE TICKET ======
-async def create_ticket_from_interaction(interaction: discord.Interaction, ticket_type: str):
-    gid = str(interaction.guild.id)
+# ================= CREATE TICKET =================
+async def create_ticket_from_interaction(inter, ttype):
+    gid = str(inter.guild.id)
     ensure_guild_config(gid)
-    gconf = config.data.get(gid, {})
-    category_id = gconf.get("ticket_category")
-    category = interaction.guild.get_channel(category_id) if category_id else None
+    gconf = config.data[gid]
+    category = inter.guild.get_channel(gconf.get("ticket_category"))
     if not category:
-        return await interaction.followup.send("❌ Ticket system chưa được setup (category missing).", ephemeral=True)
-
-    reason = is_blacklisted(interaction.guild, interaction.user)
-    if reason:
-        return await interaction.followup.send(f"🚫 Bạn đã bị blacklist theo {reason}!", ephemeral=True)
-
+        return await inter.followup.send("❌ Ticket chưa setup!", ephemeral=True)
+    if is_blacklisted(inter.guild, inter.user):
+        return await inter.followup.send("🚫 Bạn đã bị blacklist!", ephemeral=True)
     tickets.data["last_id"] += 1
     tid = tickets.data["last_id"]
 
     overwrites = {
-        interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True)
+        inter.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        inter.user: discord.PermissionOverwrite(view_channel=True)
     }
-    staff_role_id = gconf.get("staff_role")
-    if staff_role_id:
-        staff_role = interaction.guild.get_role(staff_role_id)
-        if staff_role:
-            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-
-    safe_type = ticket_type.replace(" ", "").lower()
-    ch_name = f"ticket-{tid}-{safe_type}"
-    ch = await category.create_text_channel(name=ch_name, overwrites=overwrites)
-
-    tickets.data["tickets"][str(ch.id)] = {"id": tid, "user": interaction.user.id, "type": ticket_type}
+    staff = inter.guild.get_role(gconf.get("staff_role")) if gconf.get("staff_role") else None
+    if staff:
+        overwrites[staff] = discord.PermissionOverwrite(view_channel=True)
+    ch = await category.create_text_channel(f"ticket-{tid}-{ttype.replace(' ','')}", overwrites=overwrites)
+    tickets.data["tickets"][str(ch.id)] = {"id": tid, "user": inter.user.id, "type": ttype}
     tickets.mark_dirty()
-
-    await interaction.followup.send(f"✅ Ticket #{tid} (**{ticket_type}**) đã được tạo: {ch.mention}", ephemeral=True)
-    await ch.send(f"🎟️ Ticket #{tid} | {ticket_type} – Xin chào {interaction.user.mention}!")
-    await log_ticket_event(interaction.guild, f"🟢 Ticket #{tid} | created by {interaction.user.mention}")
-
-
-# ====== COMMANDS (các lệnh /setup_ticket, /panel, /close, /rename, /add, /blacklist, /unblacklist, /button, /re_sync) ======
-# (Giữ nguyên như trong code gốc — không cần đổi)
+    await inter.followup.send(f"✅ Ticket #{tid} ({ttype}) đã tạo: {ch.mention}", ephemeral=True)
+    await ch.send(f"🎫 Ticket #{tid} — {ttype}\nXin chào {inter.user.mention}!")
+    await log_ticket_event(inter.guild, f"🟢 Ticket #{tid} tạo bởi {inter.user.mention}")
 
 
-# ====== BOT STARTUP ======
+# ================= COMMANDS =================
+@bot.tree.command(name="setup_ticket", description="Cấu hình ticket system")
+@is_admin_or_staff()
+async def setup_ticket(inter, category: discord.CategoryChannel, staff_role: discord.Role, log_channel: discord.TextChannel):
+    gid = str(inter.guild.id)
+    ensure_guild_config(gid)
+    gconf = config.data[gid]
+    gconf["ticket_category"] = category.id
+    gconf["staff_role"] = staff_role.id
+    gconf["log_channel"] = log_channel.id
+    config.mark_dirty()
+    await inter.response.send_message("✅ Setup thành công!", ephemeral=True)
+
+
+@bot.tree.command(name="panel", description="Gửi bảng tạo ticket")
+@is_admin_or_staff()
+async def panel(inter):
+    gid = str(inter.guild.id)
+    ensure_guild_config(gid)
+    view = make_ticket_view(inter.guild.id)
+    msg = await inter.channel.send("🎫 **Tạo ticket tại đây:**", view=view)
+    config.data[gid]["panel_message"] = msg.id
+    config.mark_dirty()
+    await inter.response.send_message("✅ Đã gửi panel!", ephemeral=True)
+
+
+@bot.tree.command(name="close", description="Đóng ticket")
+@is_admin_or_staff_or_owner()
+async def close(inter):
+    cid = str(inter.channel.id)
+    if cid not in tickets.data["tickets"]:
+        return await inter.response.send_message("Không phải kênh ticket.", ephemeral=True)
+    file = await generate_transcript(inter.channel)
+    user_id = tickets.data["tickets"][cid]["user"]
+    user = inter.guild.get_member(user_id)
+    if user:
+        try:
+            await user.send("📜 Ticket của bạn đã đóng:", file=file)
+        except:
+            pass
+    del tickets.data["tickets"][cid]
+    tickets.mark_dirty()
+    await log_ticket_event(inter.guild, f"🔴 Ticket {cid} đóng bởi {inter.user.mention}")
+    await inter.response.send_message("✅ Đóng ticket sau 5s.")
+    await asyncio.sleep(5)
+    await inter.channel.delete()
+
+
+@bot.tree.command(name="rename", description="Đổi tên ticket")
+@is_admin_or_staff_or_owner()
+async def rename(inter, new_name: str):
+    await inter.channel.edit(name=new_name)
+    await inter.response.send_message(f"✅ Đã đổi tên kênh thành `{new_name}`", ephemeral=True)
+
+
+@bot.tree.command(name="add", description="Thêm người vào ticket")
+@is_admin_or_staff_or_owner()
+async def add(inter, member: discord.Member):
+    await inter.channel.set_permissions(member, view_channel=True, send_messages=True)
+    await inter.response.send_message(f"✅ Đã thêm {member.mention} vào ticket!", ephemeral=True)
+
+
+@bot.tree.command(name="blacklist", description="Thêm vào blacklist")
+@is_admin_or_staff()
+async def blacklist_cmd(inter, member: discord.Member = None, role: discord.Role = None):
+    if member:
+        blacklist.data["users"].append(member.id)
+    elif role:
+        blacklist.data["roles"].append(role.id)
+    else:
+        return await inter.response.send_message("❌ Hãy chọn user hoặc role!", ephemeral=True)
+    blacklist.mark_dirty()
+    await inter.response.send_message("✅ Đã thêm vào blacklist.", ephemeral=True)
+
+
+@bot.tree.command(name="unblacklist", description="Gỡ khỏi blacklist")
+@is_admin_or_staff()
+async def unblacklist(inter, member: discord.Member = None, role: discord.Role = None):
+    if member and member.id in blacklist.data["users"]:
+        blacklist.data["users"].remove(member.id)
+    elif role and role.id in blacklist.data["roles"]:
+        blacklist.data["roles"].remove(role.id)
+    else:
+        return await inter.response.send_message("❌ Không tìm thấy!", ephemeral=True)
+    blacklist.mark_dirty()
+    await inter.response.send_message("✅ Đã gỡ khỏi blacklist.", ephemeral=True)
+
+
+@bot.tree.command(name="button", description="Thêm nút custom")
+@is_admin_or_staff()
+async def button_cmd(inter, label: str):
+    gid = str(inter.guild.id)
+    ensure_guild_config(gid)
+    config.data[gid]["custom_buttons"].append(label)
+    config.mark_dirty()
+    await inter.response.send_message(f"✅ Đã thêm nút `{label}`!", ephemeral=True)
+
+
+@bot.tree.command(name="re_sync", description="Đồng bộ lại command")
+@is_admin_or_staff()
+async def re_sync(inter):
+    await bot.tree.sync()
+    await inter.response.send_message("✅ Đã sync lại slash commands!", ephemeral=True)
+
+
+# ================= STARTUP =================
 @bot.event
 async def on_ready():
     bot.loop.create_task(periodic_saver())
@@ -253,17 +335,17 @@ async def on_ready():
     print(f"✅ Logged in as {bot.user}")
     try:
         await bot.tree.sync()
-        print("✅ Slash commands synced successfully!")
+        print("✅ Commands synced!")
     except Exception as e:
-        print("Failed to sync commands:", e)
+        print("Sync failed:", e)
 
 
-# ====== KEEP ALIVE SERVER (for UptimeRobot) ======
+# ================= KEEP ALIVE (UptimeRobot) =================
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "✅ Ticket bot is running and ready!"
+    return "✅ Ticket bot is running!"
 
 def run_web():
     port = int(os.getenv("PORT", 8080))
@@ -272,9 +354,9 @@ def run_web():
 threading.Thread(target=run_web).start()
 
 
-# ====== RUN BOT ======
+# ================= RUN =================
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN missing in .env")
+    raise RuntimeError("Missing DISCORD_TOKEN in .env")
 bot.run(TOKEN)
