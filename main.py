@@ -3,6 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 from io import StringIO
+from keep_alive import keep_alive
 
 # ==== FILE PATHS ====
 CONFIG_FILE = "config.json"
@@ -320,8 +321,10 @@ async def on_ready():
         print("Sync failed:", e)
 
 # ==== RUN ====
-load_dotenv()
+if __name__ == "__main__":
+    keep_alive()
+    load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN in .env")
+    raise RuntimeError("DISCORD_TOKEN missing in environment (.env)")
 bot.run(TOKEN)
