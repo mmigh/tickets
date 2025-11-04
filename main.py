@@ -91,56 +91,12 @@ async def ensure_logs_channel(guild: discord.Guild) -> discord.TextChannel:
     ch = await guild.create_text_channel("logs-ticket", overwrites=overwrites)
     return ch
 
-# Modify the log_ticket_event function to include transcript support
-async def log_ticket_event(guild: discord.Guild, message: str, transcript: discord.File = None):
+async def log_ticket_event(guild: discord.Guild, message: str):
     try:
         ch = await ensure_logs_channel(guild)
-        if transcript:
-            await ch.send(content=message, file=transcript)
-        else:
-            await ch.send(message)
+        await ch.send(message)
     except Exception as e:
         print("Failed to log event:", e)
-
-# Modify create_ticket_from_interaction to only log creation
-async def create_ticket_from_interaction(interaction: discord.Interaction, ticket_type: str):
-    gid = str(interaction.guild.id)
-    ensure_guild_config(gid)
-    gconf = config.data.get(gid, {})
-    category_id = gconf.get("ticket_category")
-    category = interaction.guild.get_channel(category_id) if category_id else None
-    if not category:
-        return await interaction.followup.send("❌ Ticket system chưa được setup (category missing).", ephemeral=True)
-
-    # blacklist check
-    reason = is_blacklisted(interaction.guild, interaction.user)
-    if reason:
-        return await interaction.followup.send(f"🚫 Bạn đã bị blacklist theo {reason}!", ephemeral=True)
-
-    # create ticket id & channel
-    tickets.data["last_id"] += 1
-    tid = tickets.data["last_id"]
-
-    overwrites = {
-        interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True)
-    }
-    staff_role_id = gconf.get("staff_role")
-    if staff_role_id:
-        staff_role = interaction.guild.get_role(staff_role_id)
-        if staff_role:
-            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-
-    safe_type = ticket_type.replace(" ", "").lower()
-    ch_name = f"ticket-{tid}-{safe_type}"
-    ch = await category.create_text_channel(name=ch_name, overwrites=overwrites)
-
-    tickets.data["tickets"][str(ch.id)] = {"id": tid, "user": interaction.user.id, "type": ticket_type}
-    tickets.mark_dirty()
-
-    await interaction.followup.send(f"✅ Ticket #{tid} (**{ticket_type}**) đã được tạo: {ch.mention}", ephemeral=True)
-    await ch.send(f"🎟️ Ticket #{tid} | {ticket_type} – Xin chào {interaction.user.mention}!")
-    await log_ticket_event(interaction.guild, f"🟢 Ticket #{tid} | created by {interaction.user.mention}")
 
 async def generate_transcript(channel: discord.TextChannel) -> discord.File:
     buf = StringIO()
@@ -371,7 +327,7 @@ async def panel(interaction: discord.Interaction):
         if lc:
             await lc.send(f"🟢 {interaction.user.mention} vừa gửi panel ticket tại {interaction.channel.mention}")
 
-# Modify close command to only log closure with transcript
+# close: admin/staff/owner allowed
 @bot.tree.command(name="close", description="Đóng ticket và gửi transcript vào logs-ticket")
 @is_admin_or_staff_or_owner()
 async def close(interaction: discord.Interaction):
@@ -379,17 +335,12 @@ async def close(interaction: discord.Interaction):
     cid = str(interaction.channel.id)
     if cid not in tickets.data.get("tickets", {}):
         return await interaction.followup.send("❌ Đây không phải ticket!", ephemeral=True)
-    
     info = tickets.data["tickets"].pop(cid)
     tickets.mark_dirty()
 
     transcript = await generate_transcript(interaction.channel)
-    await log_ticket_event(
-        interaction.guild,
-        f"🔴 Ticket #{info['id']} | closed by {interaction.user.mention}",
-        transcript
-    )
-    
+    logs = await ensure_logs_channel(interaction.guild)
+    await logs.send(content=f"🔴 Ticket #{info['id']} | closed by {interaction.user.mention}", file=transcript)
     await interaction.followup.send("✅ Ticket đã được đóng và transcript đã gửi về logs channel!", ephemeral=True)
     await asyncio.sleep(3)
     try:
@@ -413,6 +364,7 @@ async def rename(interaction: discord.Interaction, new_name: str):
     except Exception:
         pass
     await interaction.followup.send(f"✏️ Đã đổi tên ticket thành **{safe}**!", ephemeral=True)
+    await log_ticket_event(interaction.guild, f"✏️ Ticket #{tickets.data['tickets'][cid]['id']} renamed by {interaction.user.mention}")
 
 # add
 @bot.tree.command(name="add", description="Thêm người dùng vào ticket hiện tại")
@@ -568,8 +520,8 @@ async def on_ready():
 
 # ====== RUN ======
 if __name__ == "__main__":
-    load_dotenv()
     keep_alive()
+    load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN missing in environment (.env)")
