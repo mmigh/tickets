@@ -1,3 +1,4 @@
+
 # tickets.py — Optimized, persistent buttons, /button and /re_sync added
 import discord
 from discord.ext import commands, tasks
@@ -6,7 +7,6 @@ import json, os, asyncio
 from dotenv import load_dotenv
 from io import StringIO
 from typing import List
-from keep_alive import keep_alive
 
 # ====== FILE PATHS ======
 CONFIG_FILE = "config.json"
@@ -519,9 +519,7 @@ async def on_ready():
         print("Failed to sync commands:", e)
 
 # ====== RUN ======
-if __name__ == "__main__":
-    keep_alive()
-    load_dotenv()
+load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN missing in environment (.env)")
