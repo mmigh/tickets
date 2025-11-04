@@ -312,4 +312,9 @@ async def rename(interaction: discord.Interaction, new_name: str):
         await interaction.followup.send("❌ Lỗi khi đổi tên!", ephemeral=True)
 
 # ========= RUN =========
-bot.run("MTQxNjc3MTA4ODAzMjk5MzMyMA.GyZBuV.CfLwNNru6KrYYlYYdHqjs9yb2XSyB2Q0uG3w5Q")
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN missing in environment (.env)")
+bot.run(TOKEN)
+
